@@ -8,8 +8,10 @@ from torch.utils.data import DataLoader , Dataset
 from collections import Counter
 import gensim.downloader as api
 from conlleval import evaluate
-
+from tqdm import tqdm
 nlp = spacy.load("en_core_web_sm")
+
+
 def bio_tagging(tokens, entities):
     tags = ["O"] * len(tokens) 
     
@@ -32,9 +34,9 @@ def bio_tagging(tokens, entities):
 
 
 class ATE_Dataset(Dataset):
-    def __init__(self, sentences, labels, word2idx, max_len=100):
+    def __init__(self, sentences, labels, word2idx, label2idx, max_len=100):
         self.sentences = [[word2idx.get(word, word2idx['<UNK>']) for word in sent] for sent in sentences]
-        self.labels = [[label for label in lab] for lab in labels]
+        self.labels = [[label2idx.get(label, 0) for label in lab] for lab in labels]  # Convert labels to indices
         self.max_len = max_len
     
     def __len__(self):
@@ -47,9 +49,10 @@ class ATE_Dataset(Dataset):
         # Padding
         pad_len = max(0, self.max_len - len(sent))
         sent = sent[:self.max_len] + [0] * pad_len
-        label = label[:self.max_len] + [0] * pad_len
+        label = label[:self.max_len] + [0] * pad_len  # Ensure labels are also padded
         
-        return torch.tensor(sent), torch.tensor(label)
+        return torch.tensor(sent, dtype=torch.long), torch.tensor(label, dtype=torch.long)
+
 
 
 class RNN_ATE(nn.Module):
@@ -80,40 +83,10 @@ class GRU_ATE(nn.Module):
         return x
     
 
-    
-def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10):
-    train_losses, val_losses = [], []
-    
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs).permute(0, 2, 1)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        
-        train_losses.append(total_loss / len(train_loader))
-        
-        # Validation phase
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs).permute(0, 2, 1)
-                loss = criterion(outputs, targets)
-                val_loss += loss.item()
-        
-        val_losses.append(val_loss / len(val_loader))
-        print(f"Epoch {epoch+1}: Train Loss = {train_losses[-1]:.4f}, Val Loss = {val_losses[-1]:.4f}")
-    
-    return train_losses, val_losses
 
-
+def build_label2idx(labels):
+    unique_labels = set(label for seq in labels for label in seq)
+    return {label: idx for idx, label in enumerate(unique_labels, start=0)}
 
 def build_word2idx(sentences, min_freq=1):
     word_counts = Counter(word for sentence in sentences for word in sentence)
@@ -165,6 +138,87 @@ def load_pretrained_embeddings(embedding_path, word2idx, embedding_dim):
                 print(f"Skipping malformed line: {line[:50]}...")  # Print first 50 chars of the bad line
     
     return torch.tensor(embeddings, dtype=torch.float32)
+    
+
+    
+def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10):
+    train_losses, val_losses = [], []
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+        
+        for inputs, targets in progress_bar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs).permute(0, 2, 1)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            progress_bar.set_postfix(loss=total_loss / len(train_loader))
+        
+        train_losses.append(total_loss / len(train_loader))
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs).permute(0, 2, 1)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item()
+        
+        val_losses.append(val_loss / len(val_loader))
+        print(f"Epoch {epoch+1}: Train Loss = {train_losses[-1]:.4f}, Val Loss = {val_losses[-1]:.4f}")
+    
+    return train_losses, val_losses
+
+
+def predict_aspect_terms(model, sentence, word2idx, idx2label, max_len=100, device='cpu'):
+    model.eval()
+    
+    # Tokenize and convert words to indices
+    sentence_tokens = sentence.split()  # Ensure tokenization matches training
+    input_ids = [word2idx.get(word, word2idx['<UNK>']) for word in sentence_tokens]
+
+    # Pad sequence
+    pad_len = max(0, max_len - len(input_ids))
+    input_ids = input_ids[:max_len] + [0] * pad_len  # Pad or truncate
+
+    # Convert to tensor
+    input_tensor = torch.tensor([input_ids], dtype=torch.long).to(device)
+
+    # Predict
+    with torch.no_grad():
+        output = model(input_tensor)
+        predictions = torch.argmax(output, dim=2).cpu().numpy()[0]  # Get highest-probability labels
+
+    predicted_labels = [idx2label[idx] for idx in predictions[:len(sentence_tokens)]]
+
+    
+    aspect_terms = []
+    current_term = []
+
+    for word, label in zip(sentence_tokens, predicted_labels):
+        if label == "B":  # Beginning of an aspect
+            if current_term:
+                aspect_terms.append(" ".join(current_term))  # Store previous aspect
+            current_term = [word]  # Start new aspect
+        elif label == "I":  # Inside an aspect
+            current_term.append(word)
+        else:
+            if current_term:
+                aspect_terms.append(" ".join(current_term))  # Store aspect term
+                current_term = []
+
+    if current_term:
+        aspect_terms.append(" ".join(current_term))  # Store last aspect term
+
+    return aspect_terms
+
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,20 +239,41 @@ if __name__ == "__main__":
 
     # print("JSON file saved successfully!")
     sentences_train, labels_train = load_dataset("train_task 1.json")
-    word2idx = build_word2idx(sentences_train)
+    sentences_val , labels_val = load_dataset("val_task 1.json")
+    word2idxTrain = build_word2idx(sentences_train)
+    label2idxTrain = build_label2idx(labels_train)
+
+
+    word2idx_Val = build_word2idx(sentences_val)
+    label2idxVal = build_label2idx(labels_val)
+    
+
     embedding_dim = 300
-    embedding_matrix = load_pretrained_embeddings("glove.840B.300d.txt", word2idx, embedding_dim)
+    embedding_matrix = load_pretrained_embeddings("glove.840B.300d.txt", word2idxTrain, embedding_dim)
 
 
 
-    train_dataset = ATE_Dataset(sentences_train, labels_train, word2idx)
+    train_dataset = ATE_Dataset(sentences_train, labels_train, word2idxTrain, label2idxTrain)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
+    val_dataset = ATE_Dataset(sentences_val, labels_val, word2idx_Val, label2idxVal)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=True)
     
     
-    model = GRU_ATE(vocab_size=len(word2idx), embedding_dim=embedding_dim, hidden_dim=128, output_dim=3, pretrained_embeddings=embedding_matrix).to(device)
+    model = GRU_ATE(vocab_size=len(word2idxTrain), embedding_dim=embedding_dim, hidden_dim=128, output_dim=3, pretrained_embeddings=embedding_matrix).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
-    train_losses, val_losses = train_model(model, train_loader, None, criterion, optimizer, epochs=10)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10)
 
-    print(embedding_matrix)
+
+    idx2label = {idx: label for label, idx in label2idxTrain.items()}
+
+
+    sentence = "The food was delicious but the service was slow."
+    predicted_aspects = predict_aspect_terms(model, sentence, word2idxTrain, idx2label, device=device)
+
+    print("Predicted Aspect Terms:", predicted_aspects)
+
+
+    
 
