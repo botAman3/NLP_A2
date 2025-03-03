@@ -161,7 +161,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10
         
         train_losses.append(total_loss / len(train_loader))
         
-        # Validation phase
+        
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -194,7 +194,7 @@ def predict_aspect_terms(model, sentence, word2idx, idx2label, max_len=100, devi
     # Predict
     with torch.no_grad():
         output = model(input_tensor)
-        predictions = torch.argmax(output, dim=2).cpu().numpy()[0]  # Get highest-probability labels
+        predictions = torch.argmax(output, dim=2).cpu().numpy()[0]  
 
     predicted_labels = [idx2label[idx] for idx in predictions[:len(sentence_tokens)]]
 
@@ -203,21 +203,56 @@ def predict_aspect_terms(model, sentence, word2idx, idx2label, max_len=100, devi
     current_term = []
 
     for word, label in zip(sentence_tokens, predicted_labels):
-        if label == "B":  # Beginning of an aspect
+        if label == "B":  
             if current_term:
-                aspect_terms.append(" ".join(current_term))  # Store previous aspect
-            current_term = [word]  # Start new aspect
-        elif label == "I":  # Inside an aspect
+                aspect_terms.append(" ".join(current_term))  
+            current_term = [word]  
+        elif label == "I":  
             current_term.append(word)
         else:
             if current_term:
-                aspect_terms.append(" ".join(current_term))  # Store aspect term
+                aspect_terms.append(" ".join(current_term))  
                 current_term = []
 
     if current_term:
-        aspect_terms.append(" ".join(current_term))  # Store last aspect term
+        aspect_terms.append(" ".join(current_term))  
 
     return aspect_terms
+
+
+def evaluate_model(model, data_loader, idx2label, device="cpu"):
+    model.eval()
+    true_labels, pred_labels = [], []
+
+    with torch.no_grad():
+        for inputs, targets in data_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            predictions = torch.argmax(outputs, dim=2).cpu().numpy()
+            targets = targets.cpu().numpy()
+
+            for i in range(len(inputs)):
+                true_seq, pred_seq = [], []
+                for j in range(len(inputs[i])):
+                    if inputs[i][j].item() == 0:  # Ignore padding
+                        continue
+                    true_seq.append(idx2label[targets[i][j]])
+                    pred_seq.append(idx2label[predictions[i][j]])
+                
+                true_labels.append(true_seq)
+                pred_labels.append(pred_seq)
+
+    # **Ensure labels follow IOB2 format**
+    true_labels_flat = [label if "-" in label or label == "O" else f"I-{label}" for seq in true_labels for label in seq]
+    pred_labels_flat = [label if "-" in label or label == "O" else f"I-{label}" for seq in pred_labels for label in seq]
+
+    # Evaluate using conlleval
+    chunk_result = evaluate(true_labels_flat, pred_labels_flat, verbose=True)
+
+    print("\nChunk-Level Performance:")
+    print(f"Precision: {chunk_result[0]:.2f}, Recall: {chunk_result[1]:.2f}, F1-Score: {chunk_result[2]:.2f}")
+
+    return chunk_result
 
 
 if __name__ == "__main__":
@@ -273,6 +308,9 @@ if __name__ == "__main__":
     predicted_aspects = predict_aspect_terms(model, sentence, word2idxTrain, idx2label, device=device)
 
     print("Predicted Aspect Terms:", predicted_aspects)
+
+    print("Evaluating on Test Data...")
+    evaluate_model(model, train_loader, idx2label, device=device)
 
 
     
