@@ -177,6 +177,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10
     return train_losses, val_losses
 
 
+
+
+
 def predict_aspect_terms(model, sentence, word2idx, idx2label, max_len=100, device='cpu'):
     model.eval()
     
@@ -218,6 +221,9 @@ def predict_aspect_terms(model, sentence, word2idx, idx2label, max_len=100, devi
         aspect_terms.append(" ".join(current_term))  
 
     return aspect_terms
+
+
+
 
 
 def evaluate_model(model, data_loader, idx2label, device="cpu"):
@@ -282,7 +288,6 @@ if __name__ == "__main__":
     word2idx_Val = build_word2idx(sentences_val)
     label2idxVal = build_label2idx(labels_val)
     
-
     embedding_dim = 300
     embedding_matrix = load_pretrained_embeddings("glove.840B.300d.txt", word2idxTrain, embedding_dim)
 
@@ -295,22 +300,33 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=True)
     
     
-    model = GRU_ATE(vocab_size=len(word2idxTrain), embedding_dim=embedding_dim, hidden_dim=128, output_dim=3, pretrained_embeddings=embedding_matrix).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    GRU_ATEmodel = GRU_ATE(vocab_size=len(word2idxTrain), embedding_dim=embedding_dim, hidden_dim=128, output_dim=3, pretrained_embeddings=embedding_matrix).to(device)
+    RNN_ATEmodel = RNN_ATE(vocab_size=len(word2idxTrain) , embedding_dim=embedding_dim , hidden_dim=128 , output_dim=3 , pretrained_embeddings=embedding_matrix).to(device=device)
+    optimizer_GRUATE = optim.Adam(GRU_ATEmodel.parameters(), lr=0.001)
+    optimizer_RNNATE = optim.Adam(RNN_ATEmodel.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
-    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10)
+
+    train_losses, val_losses = train_model(GRU_ATEmodel, train_loader, val_loader, criterion, optimizer_GRUATE, epochs=10)
+    train_losses, val_losses = train_model(RNN_ATEmodel, train_loader, val_loader, criterion, optimizer_RNNATE, epochs=10)
 
 
     idx2label = {idx: label for label, idx in label2idxTrain.items()}
 
 
     sentence = "The food was delicious but the service was slow."
-    predicted_aspects = predict_aspect_terms(model, sentence, word2idxTrain, idx2label, device=device)
+    predicted_aspects = predict_aspect_terms(GRU_ATEmodel, sentence, word2idxTrain, idx2label, device=device)
 
-    print("Predicted Aspect Terms:", predicted_aspects)
+    print("Predicted Aspect Terms from GRU MODEL:", predicted_aspects)
 
-    print("Evaluating on Test Data...")
-    evaluate_model(model, train_loader, idx2label, device=device)
+
+    predicted_aspects = predict_aspect_terms(RNN_ATEmodel, sentence, word2idxTrain, idx2label, device=device)
+
+    print("Predicted Aspect Terms from RNN MODEL:", predicted_aspects)
+    print("Evaluating GRU on Test Data...")
+    evaluate_model(GRU_ATEmodel, train_loader, idx2label, device=device)
+
+    print("Evaluating RNN on Test Data...")
+    evaluate_model(RNN_ATEmodel, train_loader, idx2label, device=device)
 
 
     
