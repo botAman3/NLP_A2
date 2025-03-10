@@ -10,7 +10,6 @@ from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 from gensim.models import KeyedVectors
 
-
 # Load spaCy English model
 nlp = spacy.load("en_core_web_sm")
 
@@ -18,7 +17,6 @@ nlp = spacy.load("en_core_web_sm")
 infixes = nlp.Defaults.infixes  # Default tokenizer rules
 infixes = [x for x in infixes if x not in [r"\'"]]  # Remove the rule that splits contractions
 nlp.tokenizer = Tokenizer(nlp.vocab, infix_finditer=None)  # Rebuild tokenizer without infix splitting
-
 
 # Function to get word embedding
 def get_embedding(word):
@@ -58,7 +56,7 @@ def preprocess_data(json_data):
                 preprocessed_data.append({
                     "tokens": tokens,
                     "polarity": polarity,
-                    "aspect term": [aspect_term],  # Ensure correct formatting
+                    "aspect term": aspect_term,
                     "index": index
                 })
 
@@ -69,12 +67,11 @@ def save_preprocessed_data(file_path,json_data):
     with open(save_path, "w", encoding="utf-8") as file:
         json.dump(json_data, file, indent=4)
 
-# Load and preprocess cc
+# Load and preprocess dataset
 def load_and_preprocess(file_path):
     with open(file_path, "r", encoding="utf-8") as file:
         json_data = json.load(file)
     preprocessed_data = preprocess_data(json_data)
-    # save_preprocessed_data(file_path,preprocessed_data)
     return preprocessed_data
 
 # Custom PyTorch Dataset
@@ -88,22 +85,23 @@ class ABSADataset(Dataset):
     def __getitem__(self, idx):
         sample = self.data[idx]
         tokens = sample["tokens"]
-        aspect_term = sample["aspect term"][0]
+        aspect_term = sample["aspect term"]
         index = sample["index"]
         polarity = sample["polarity"]
 
         token_embeddings = torch.stack([get_embedding(tok) for tok in tokens])
+        aspect_embedding = get_embedding(aspect_term)
 
         polarity_map = {"positive": 2, "negative": 0, "neutral": 1, "conflict": 3}
         polarity_label = polarity_map[polarity]
 
-        return token_embeddings, index, polarity_label
+        return token_embeddings, aspect_embedding, index, polarity_label
 
 # Function to collate batch with padding
 def collate_fn(batch):
-    sequences, indices, labels = zip(*batch)
+    sequences, aspects, indices, labels = zip(*batch)
     padded_sequences = pad_sequence(sequences, batch_first=True)
-    return padded_sequences, torch.tensor(indices), torch.tensor(labels)
+    return padded_sequences, torch.stack(aspects), torch.tensor(indices), torch.tensor(labels)
 
 # Prepare DataLoaders
 def prepare_dataset(train_path, val_path):
@@ -116,17 +114,19 @@ def prepare_dataset(train_path, val_path):
     print("Dataset Prepared")
     return train_loader, val_loader
 
-# BiLSTM with Attention Model
+# BiLSTM with Aspect-Specific Attention Model
 class BiLSTMAttention(nn.Module):
     def __init__(self, embedding_dim, hidden_dim, num_classes):
         super(BiLSTMAttention, self).__init__()
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, bidirectional=True, batch_first=True)
+        self.aspect_fc = nn.Linear(embedding_dim, hidden_dim * 2)
         self.attention = nn.Linear(hidden_dim * 2, 1)
         self.fc = nn.Linear(hidden_dim * 2, num_classes)
     
-    def forward(self, x, index):
+    def forward(self, x, aspect_embedding, index):
         lstm_out, _ = self.lstm(x)
-        attention_weights = torch.softmax(self.attention(lstm_out), dim=1)
+        aspect_proj = self.aspect_fc(aspect_embedding).unsqueeze(1)
+        attention_weights = torch.softmax(self.attention(lstm_out + aspect_proj), dim=1)
         context_vector = torch.sum(attention_weights * lstm_out, dim=1)
         output = self.fc(context_vector)
         return output
@@ -136,9 +136,9 @@ def evaluate_model(model, val_loader):
     correct = 0
     total = 0
     with torch.no_grad():
-        for inputs, indices, labels in val_loader:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-            outputs = model(inputs, indices)
+        for inputs, aspects, indices, labels in val_loader:
+            inputs, aspects, labels = inputs.to(DEVICE), aspects.to(DEVICE), labels.to(DEVICE)
+            outputs = model(inputs, aspects, indices)
             _, predicted = torch.max(outputs, 1)
             correct += (predicted == labels).sum().item()
             total += labels.size(0)
@@ -150,7 +150,7 @@ def evaluate_model(model, val_loader):
 def train_model(train_loader, val_loader):
     model = BiLSTMAttention(EMBEDDING_DIM, HIDDEN_DIM, NUM_CLASSES).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
 
     for epoch in range(EPOCHS):
         model.train()
@@ -158,11 +158,10 @@ def train_model(train_loader, val_loader):
         correct = 0
         total = 0
 
-        for inputs, indices, labels in train_loader:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-
+        for inputs, aspects, indices, labels in train_loader:
+            inputs, aspects, labels = inputs.to(DEVICE), aspects.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
-            outputs = model(inputs, indices)
+            outputs = model(inputs, aspects, indices)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -173,8 +172,7 @@ def train_model(train_loader, val_loader):
             total += labels.size(0)
 
         train_acc = correct / total if total > 0 else 0
-        val_acc = evaluate_model(model, val_loader)  # Compute validation accuracy
-
+        val_acc = evaluate_model(model, val_loader)
         print(f"Epoch [{epoch+1}/{EPOCHS}], Loss: {total_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
 
     return model
@@ -211,11 +209,11 @@ if __name__ == "__main__":
     # Load pre-trained FastText embeddings (Modify path)
     EMBEDDING_PATH = "/home/aasif057/nlp_embeddings/cc.en.300.vec"
     EMBEDDING_DIM = 300
-    HIDDEN_DIM = 128
+    HIDDEN_DIM = 256
     NUM_CLASSES = 4  # Positive, Negative, Neutral, Conflict
     BATCH_SIZE = 32
     EPOCHS = 20
-    LEARNING_RATE = 0.001
+    LEARNING_RATE = 0.0005
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(DEVICE)
     # Load FastText word vectors
@@ -226,7 +224,7 @@ if __name__ == "__main__":
     print(f"Train loader size: {len(train_loader.dataset)}")
     trained_model = train_model(train_loader, val_loader)
     print("3")
-    save_checkpoint(trained_model)
+    # save_checkpoint(trained_model)
 
     # # Load model and test a sample sentence
     # model = load_checkpoint()
