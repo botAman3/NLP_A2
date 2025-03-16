@@ -1,42 +1,39 @@
-import json 
-import numpy as np 
-import spacy 
-import torch 
-import torch.nn as nn 
+import json
+import numpy as np
+import torch
+import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader , Dataset
+from torch.utils.data import DataLoader, Dataset
 from collections import Counter
 import gensim.downloader as api
 from conlleval import evaluate
 from tqdm import tqdm
-nlp = spacy.load("en_core_web_sm")
+import gensim.downloader as api
+from matplotlib import pyplot as plt
 
+def load_pretrained_embeddings( word2idx, embedding_dim , model_name = 'glove-wiki-gigaword-300'):
+    """Loads embeddings from gensim and maps them to the vocabulary."""
+    embedding_model = api.load(model_name)
+    embeddings = np.random.uniform(-0.25, 0.25, (len(word2idx), embedding_dim))
 
-def bio_tagging(tokens, entities):
-    tags = ["O"] * len(tokens) 
-    
-    for entity in entities:
-        entity_tokens = entity.split()
-        start_idx = -1
-        
-        # Find entity position
-        for i in range(len(tokens)):
-            if tokens[i:i+len(entity_tokens)] == entity_tokens:
-                start_idx = i
-                break
-        
-        if start_idx != -1:
-            tags[start_idx] = "B"  # Mark beginning
-            for j in range(1, len(entity_tokens)):
-                tags[start_idx + j] = "I"  # Mark inside
-                
-    return tags
+    for word, idx in word2idx.items():
+        if word in embedding_model:
+            embeddings[idx] = embedding_model[word]
 
+    return torch.tensor(embeddings, dtype=torch.float32)
+
+def load_fasttext_embeddings(word2idx, embedding_dim=300):
+    fasttext_model = api.load("fasttext-wiki-news-subwords-300")
+    embeddings = np.random.uniform(-0.25, 0.25, (len(word2idx), embedding_dim))
+    for word, idx in word2idx.items():
+        if word in fasttext_model:
+            embeddings[idx] = fasttext_model[word]
+    return torch.tensor(embeddings, dtype=torch.float32)
 
 class ATE_Dataset(Dataset):
     def __init__(self, sentences, labels, word2idx, label2idx, max_len=100):
         self.sentences = [[word2idx.get(word, word2idx['<UNK>']) for word in sent] for sent in sentences]
-        self.labels = [[label2idx.get(label, 0) for label in lab] for lab in labels]  # Convert labels to indices
+        self.labels = [[label2idx.get(label, 0) for label in lab] for lab in labels]
         self.max_len = max_len
     
     def __len__(self):
@@ -45,15 +42,10 @@ class ATE_Dataset(Dataset):
     def __getitem__(self, idx):
         sent = self.sentences[idx]
         label = self.labels[idx]
-        
-        # Padding
         pad_len = max(0, self.max_len - len(sent))
         sent = sent[:self.max_len] + [0] * pad_len
-        label = label[:self.max_len] + [0] * pad_len  # Ensure labels are also padded
-        
+        label = label[:self.max_len] + [0] * pad_len
         return torch.tensor(sent, dtype=torch.long), torch.tensor(label, dtype=torch.long)
-
-
 
 class RNN_ATE(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, pretrained_embeddings):
@@ -67,7 +59,6 @@ class RNN_ATE(nn.Module):
         x, _ = self.rnn(x)
         x = self.fc(x)
         return x
-    
 
 class GRU_ATE(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, pretrained_embeddings):
@@ -81,67 +72,8 @@ class GRU_ATE(nn.Module):
         x, _ = self.gru(x)
         x = self.fc(x)
         return x
-    
 
-
-def build_label2idx(labels):
-    unique_labels = set(label for seq in labels for label in seq)
-    return {label: idx for idx, label in enumerate(unique_labels, start=0)}
-
-def build_word2idx(sentences, min_freq=1):
-    word_counts = Counter(word for sentence in sentences for word in sentence)
-    word2idx = {word: idx + 2 for idx, (word, count) in enumerate(word_counts.items()) if count >= min_freq}
-    word2idx["<PAD>"] = 0
-    word2idx["<UNK>"] = 1
-    return word2idx
-
-def load_dataset(json_path):
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    sentences = [entry["tokens"] for entry in data.values()]
-    labels = [entry["labels"] for entry in data.values()]
-    return sentences, labels
-
-def preprocessData(jsonData):
-    preprocessedData = {}
-    for data in jsonData:
-        entities = []
-        tokens = (data['sentence']).split()
-        for f in data['aspect_terms']:
-            entities.append(f['term'])
-        bioTags = bio_tagging(tokens , entities)
-
-
-        variables = {
-            "sentence" : data['sentence'],
-            "tokens"   : tokens ,
-            "labels"   : bioTags ,
-            "aspect_terms" : entities
-        }
-
-        preprocessedData[data['sentence_id']] = variables
-
-    return preprocessedData
-
-def load_pretrained_embeddings(embedding_path, word2idx, embedding_dim):
-    embeddings = np.random.uniform(-0.25, 0.25, (len(word2idx), embedding_dim))
-    
-    with open(embedding_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            values = line.strip().split()
-            word = values[0]
-            try:
-                vector = np.asarray(values[1:], dtype=np.float32)
-                if len(vector) == embedding_dim and word in word2idx:
-                    embeddings[word2idx[word]] = vector
-            except ValueError:
-                print(f"Skipping malformed line: {line[:50]}...")  # Print first 50 chars of the bad line
-    
-    return torch.tensor(embeddings, dtype=torch.float32)
-    
-
-    
-def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10):
+def train_model(model, train_loader, val_loader, criterion, optimizer,name,epochs=10):
     train_losses, val_losses = [], []
     
     for epoch in range(epochs):
@@ -161,7 +93,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10
         
         train_losses.append(total_loss / len(train_loader))
         
-        
+        # Validation phase
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -173,57 +105,39 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10
         
         val_losses.append(val_loss / len(val_loader))
         print(f"Epoch {epoch+1}: Train Loss = {train_losses[-1]:.4f}, Val Loss = {val_losses[-1]:.4f}")
-    
+
+    # **Plot Training & Validation Loss**
+    plt.figure(figsize=(8,6))
+    plt.plot(range(1, epochs+1), train_losses, label="Train Loss", marker='o')
+    plt.plot(range(1, epochs+1), val_losses, label="Validation Loss", marker='o')
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.title("Training & Validation Loss")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    plt.savefig(f'{name}.png')
+
     return train_losses, val_losses
 
+def build_label2idx(labels):
+    unique_labels = set(label for seq in labels for label in seq)
+    return {label: idx for idx, label in enumerate(unique_labels, start=0)}
 
+def build_word2idx(sentences, min_freq=1):
+    word_counts = Counter(word for sentence in sentences for word in sentence)
+    word2idx = {word: idx + 2 for idx, (word, count) in enumerate(word_counts.items()) if count >= min_freq}
+    word2idx["<PAD>"] = 0
+    word2idx["<UNK>"] = 1
+    return word2idx
 
-
-
-def predict_aspect_terms(model, sentence, word2idx, idx2label, max_len=100, device='cpu'):
-    model.eval()
-    
-    # Tokenize and convert words to indices
-    sentence_tokens = sentence.split()  # Ensure tokenization matches training
-    input_ids = [word2idx.get(word, word2idx['<UNK>']) for word in sentence_tokens]
-
-    # Pad sequence
-    pad_len = max(0, max_len - len(input_ids))
-    input_ids = input_ids[:max_len] + [0] * pad_len  # Pad or truncate
-
-    # Convert to tensor
-    input_tensor = torch.tensor([input_ids], dtype=torch.long).to(device)
-
-    # Predict
-    with torch.no_grad():
-        output = model(input_tensor)
-        predictions = torch.argmax(output, dim=2).cpu().numpy()[0]  
-
-    predicted_labels = [idx2label[idx] for idx in predictions[:len(sentence_tokens)]]
-
-    
-    aspect_terms = []
-    current_term = []
-
-    for word, label in zip(sentence_tokens, predicted_labels):
-        if label == "B":  
-            if current_term:
-                aspect_terms.append(" ".join(current_term))  
-            current_term = [word]  
-        elif label == "I":  
-            current_term.append(word)
-        else:
-            if current_term:
-                aspect_terms.append(" ".join(current_term))  
-                current_term = []
-
-    if current_term:
-        aspect_terms.append(" ".join(current_term))  
-
-    return aspect_terms
-
-
-
+def load_dataset(json_path):
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    sentences = [entry["tokens"] for entry in data.values()]
+    labels = [entry["labels"] for entry in data.values()]
+    return sentences, labels
 
 
 def evaluate_model(model, data_loader, idx2label, device="cpu"):
@@ -260,74 +174,45 @@ def evaluate_model(model, data_loader, idx2label, device="cpu"):
 
     return chunk_result
 
-
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # with open("train.json" , "r") as file :
-    #     train_json = json.load(file)
-
-    # with open("val.json" , "r") as file :
-    #     val_json = json.load(file)
-
-    # preprocessed_train = preprocessData(train_json)
-    # preprocessed_val = preprocessData(val_json)
-
-    # with open("train_task 1.json", "w") as file:
-    #     json.dump(preprocessed_train, file, indent=4)
-
-    # with open("val_task 1.json", "w") as file:
-    #     json.dump(preprocessed_val, file, indent=4)
-
-    # print("JSON file saved successfully!")
-    sentences_train, labels_train = load_dataset("train_task 1.json")
-    sentences_val , labels_val = load_dataset("val_task 1.json")
-    word2idxTrain = build_word2idx(sentences_train)
-    label2idxTrain = build_label2idx(labels_train)
-
-
-    word2idx_Val = build_word2idx(sentences_val)
-    label2idxVal = build_label2idx(labels_val)
     
-    embedding_dim = 300
-    embedding_matrix = load_pretrained_embeddings("glove.840B.300d.txt", word2idxTrain, embedding_dim)
-
-
-
-    train_dataset = ATE_Dataset(sentences_train, labels_train, word2idxTrain, label2idxTrain)
+    sentences_train, labels_train = load_dataset("train_task 1.json")
+    sentences_val, labels_val = load_dataset("val_task 1.json")
+    
+    word2idx = build_word2idx(sentences_train)
+    label2idx = build_label2idx(labels_train)
+    
+    glove_embeddings = load_pretrained_embeddings(word2idx, 300)
+    fasttext_embeddings = load_fasttext_embeddings(word2idx, 300)
+    
+    train_dataset = ATE_Dataset(sentences_train, labels_train, word2idx, label2idx)
+    val_dataset = ATE_Dataset(sentences_val, labels_val, word2idx, label2idx)
+    
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-
-    val_dataset = ATE_Dataset(sentences_val, labels_val, word2idx_Val, label2idxVal)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=True)
     
+    models = {
+        "RNN_GloVe": RNN_ATE(len(word2idx), 300, 128, 3, glove_embeddings),
+        "GRU_GloVe": GRU_ATE(len(word2idx), 300, 128, 3, glove_embeddings),
+        "RNN_FastText": RNN_ATE(len(word2idx), 300, 128, 3, fasttext_embeddings),
+        "GRU_FastText": GRU_ATE(len(word2idx), 300, 128, 3, fasttext_embeddings)
+    }
     
-    GRU_ATEmodel = GRU_ATE(vocab_size=len(word2idxTrain), embedding_dim=embedding_dim, hidden_dim=128, output_dim=3, pretrained_embeddings=embedding_matrix).to(device)
-    RNN_ATEmodel = RNN_ATE(vocab_size=len(word2idxTrain) , embedding_dim=embedding_dim , hidden_dim=128 , output_dim=3 , pretrained_embeddings=embedding_matrix).to(device=device)
-    optimizer_GRUATE = optim.Adam(GRU_ATEmodel.parameters(), lr=0.001)
-    optimizer_RNNATE = optim.Adam(RNN_ATEmodel.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
-
-    train_losses, val_losses = train_model(GRU_ATEmodel, train_loader, val_loader, criterion, optimizer_GRUATE, epochs=10)
-    train_losses, val_losses = train_model(RNN_ATEmodel, train_loader, val_loader, criterion, optimizer_RNNATE, epochs=10)
-
-
-    idx2label = {idx: label for label, idx in label2idxTrain.items()}
-
-
-    sentence = "The food was delicious but the service was slow."
-    predicted_aspects = predict_aspect_terms(GRU_ATEmodel, sentence, word2idxTrain, idx2label, device=device)
-
-    print("Predicted Aspect Terms from GRU MODEL:", predicted_aspects)
-
-
-    predicted_aspects = predict_aspect_terms(RNN_ATEmodel, sentence, word2idxTrain, idx2label, device=device)
-
-    print("Predicted Aspect Terms from RNN MODEL:", predicted_aspects)
-    print("Evaluating GRU on Test Data...")
-    evaluate_model(GRU_ATEmodel, train_loader, idx2label, device=device)
-
-    print("Evaluating RNN on Test Data...")
-    evaluate_model(RNN_ATEmodel, train_loader, idx2label, device=device)
-
-
     
-
+    for name, model in models.items():
+        model.to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        print(f"Training {name}...")
+        train_model(model, train_loader, val_loader, criterion, optimizer, name ,epochs=10 )
+        torch.save(model.state_dict(), f"{name}.pth")
+        print(f"Saved {name} model.")
+    
+    idx2label = {idx: label for label, idx in label2idx.items()}
+    
+    for name, model in models.items():
+        model.load_state_dict(torch.load(f"{name}.pth"))
+        model.to(device)
+        print(f"Evaluating {name}...")
+        evaluate_model(model, val_loader, idx2label, device=device)
