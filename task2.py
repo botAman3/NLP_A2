@@ -11,6 +11,9 @@ from torch.nn.utils.rnn import pad_sequence
 from gensim.models import KeyedVectors
 import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from datasets import load_dataset
+
 
 # Load spaCy English model
 nlp = spacy.load("en_core_web_sm")
@@ -149,46 +152,6 @@ def prepare_dataset(train_path, val_path):
     val_loader = DataLoader(ABSADataset(val_data), batch_size=16, shuffle=False, collate_fn=collate_fn)
     return train_loader, val_loader
 
-# Define TD_LSTM_Attention model
-
-class TD_LSTM_Attention(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim, num_classes):
-        super(TD_LSTM_Attention, self).__init__()
-        self.left_lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.right_lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.aspect_lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(hidden_dim * 6, num_classes)
-        self.dropout = nn.Dropout(0.4)
-    def forward(self, x, aspect, index):
-        # left_context, right_context = torch.zeros_like(x), torch.zeros_like(x)
-        # for i in range(x.shape[0]):
-        #     left_context[i, :index[i]] = x[i, :index[i]]
-        #     right_context[i, -len(x[i, index[i]+1:]):] = x[i, index[i]+1:]
-        # left_context = torch.zeros_like(x)
-        # right_context = torch.zeros_like(x)
-        left_contexts, right_contexts = [], []
-        for i in range(x.shape[0]):  # Iterate over batch
-            left_contexts.append(x[i, :index[i]])  # Left context
-            
-            # Ensure right context is non-empty before adding
-            if index[i] + 1 < x.shape[1]:
-                right_contexts.append(x[i, index[i]+1:])
-            else:
-                right_contexts.append(torch.zeros(1, x.shape[2], device=x.device))  # Dummy zero tensor
-
-        # Pad sequences to match max length in batch
-        left_context = torch.nn.utils.rnn.pad_sequence(left_contexts, batch_first=True)
-        right_context = torch.nn.utils.rnn.pad_sequence(right_contexts, batch_first=True)
-        
-
-        # Process through LSTMs
-        left_out, _ = self.left_lstm(left_context)
-        right_out, _ = self.right_lstm(right_context)
-
-        aspect_out, _ = self.aspect_lstm(aspect.unsqueeze(1))
-        combined_rep = torch.cat([left_out.mean(dim=1), right_out.mean(dim=1), aspect_out.squeeze(1)], dim=-1)
-        return self.fc(self.dropout(combined_rep))
-
 # Hybrid BiLSTM-GRU Model
 class HybridBiLSTMGRU(nn.Module):
     def __init__(self, embedding_dim, hidden_dim, num_classes, dropout_rate=0.6):
@@ -237,7 +200,8 @@ class HybridBiLSTMGRU(nn.Module):
 
 #Save Model Checkpoint    
 def save_model(model, model_name):
-    torch.save(model.state_dict(), f"{model_name}.pth")        
+    torch.save(model.state_dict(), f"{model_name}.pth")     
+       
 def plot_losses(train_losses, val_losses):
     plt.figure(figsize=(10,5))
     plt.plot(train_losses, label="Train Loss")
@@ -335,7 +299,108 @@ def inference(model_path, test_file):
             correct += (outputs.argmax(1) == labels).sum().item()
             total += labels.size(0)
     print(f"Test Accuracy: {correct / total:.4f}")
+
+label_map = {"positive": 2, "negative": 0, "neutral": 1, "conflict": 3}
+
+def preprocess_data2(data):
+    return data.map(lambda x: {"labels": label_map[x["polarity"]]})
+
+def tokenize_function(examples, tokenizer):
+    sentences = [" ".join(tokens) for tokens in examples["tokens"]]
+    tokenized = tokenizer(sentences, padding="max_length", truncation=True, max_length=128)
+    tokenized["labels"] = examples["labels"]  # ✅ Include labels
+    return tokenized
+
+
+# Function to compute accuracy
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)
+    accuracy = (predictions == labels).mean()
+    return {"accuracy": accuracy}
+
+# Function to plot training & validation loss
+def plot_training(history, model_name):
+    epochs = list(range(1, len(history["loss"]) + 1))
+
+    plt.figure(figsize=(8, 5))
     
+    plt.plot(epochs, history["loss"], label="Train Loss", marker="o")
+    plt.plot(epochs, history["eval_loss"], label="Val Loss", marker="o")
+
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.title(f"{model_name.upper()} Training Progress")
+    plt.legend()
+    plt.grid()
+    
+    plt.savefig(f"{model_name}_training_plot.png")
+    plt.show()
+
+# Function to train transformer models
+def train_transformer(model_name, train_dataset, val_dataset):
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAMES[model_name], num_labels=4).to(DEVICE)
+
+    training_args = TrainingArguments(
+        output_dir=f"{model_name}.pth",
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        save_total_limit=2,  # Keep only last 2 checkpoints
+        learning_rate=2e-5,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        num_train_epochs=5,
+        weight_decay=0.01,
+        logging_dir=f"./logs/{model_name}",
+        logging_steps=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_accuracy"
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        compute_metrics=compute_metrics
+    )
+
+    train_history = trainer.train()
+    trainer.save_model(f"task2_{model_name}_.pth")
+
+    # Evaluate on train and validation sets
+    train_results = trainer.evaluate(train_dataset)
+    val_results = trainer.evaluate(val_dataset)
+
+    # Print accuracy
+    print(f"{model_name.upper()} Train Accuracy: {train_results['eval_accuracy']:.4f}")
+    print(f"{model_name.upper()} Val Accuracy: {val_results['eval_accuracy']:.4f}")
+
+    # Extract loss history from logs
+    history = {
+        "loss": [log["loss"] for log in train_history.state.log_history if "loss" in log],
+        "eval_loss": [log["eval_loss"] for log in train_history.state.log_history if "eval_loss" in log]
+    }
+
+    # Call the plot function
+    plot_training(history, model_name)
+
+    return trainer, train_results["eval_accuracy"], val_results["eval_accuracy"]
+
+def prepare_datasets(train_file, val_file, model_name):
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAMES[model_name])
+
+    train_data = load_dataset("json", data_files=train_file)["train"]
+    val_data = load_dataset("json", data_files=val_file)["train"]
+    train_data = preprocess_data2(train_data)
+    val_data = preprocess_data2(val_data)
+    # Tokenize datasets correctly
+    train_dataset = train_data.map(lambda x: tokenize_function(x, tokenizer), batched=True)
+    val_dataset = val_data.map(lambda x: tokenize_function(x, tokenizer), batched=True)
+
+    return train_dataset, val_dataset
+
+
 if __name__ == "__main__":
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     EMBEDDING_DIM = 300
@@ -347,7 +412,23 @@ if __name__ == "__main__":
     LEARNING_RATE = 0.0001
     DROPOUT_RATE = 0.6
     train_loader, val_loader = prepare_dataset("train.json", "val.json")
-    # # model = TD_LSTM_Attention(EMBEDDING_DIM, HIDDEN_DIM, NUM_CLASSES).to(DEVICE)
+    # model = TD_LSTM_Attention(EMBEDDING_DIM, HIDDEN_DIM, NUM_CLASSES).to(DEVICE)
     model = HybridBiLSTMGRU(EMBEDDING_DIM, HIDDEN_DIM, NUM_CLASSES,DROPOUT_RATE)
     trained_model = train_model(model, train_loader, val_loader)
-    save_model(train_model, "best_model_checkpoint")
+    save_model(trained_model, "best_model_checkpoint")
+    
+    
+    ## Fine Tuning BERT, BART adn ROBERTA
+    MODEL_NAMES = {
+    "bert": "bert-base-uncased",
+    "roberta": "roberta-base",
+    "bart": "facebook/bart-base"
+    }
+    train_file = "train_task_2.json"
+    val_file = "val_task_2.json"
+
+    # Train models
+    for model in ["bert", "roberta", "bart"]:
+        train_dataset, val_dataset = prepare_datasets(train_file, val_file, model)
+        train_transformer(model, train_dataset, val_dataset)
+    
